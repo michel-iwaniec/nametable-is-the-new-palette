@@ -70,7 +70,7 @@
 ; Controller#1:
 ;   * Scroll background with cursor
 ;   * B + Up / Down to move the scanline where the palette rewrite is performed
-;   * B + Left / Right to fine-tune the palette rewrite's alignment with hblank between 0..3 CPU cycles (always done in single-step increments)
+;   * B + START + Left / Right to fine-tune the palette rewrite's alignment with hblank between 0..3 CPU cycles (always done in single-step increments)
 ;   * A + Left/Right to cycle which PPU palette index will be changed ($00-$1F)
 ;   * B + Up/Down to cycle values to write
 ;   * Hold START to make any of the changes above in single-step increments
@@ -578,7 +578,10 @@ UpdateRewritePosition:
     lda joy0
     and #JOY_B
     beq @dontUpdate
-    lda joyP0 ;joy0,x
+    lda joy0
+    and #JOY_START
+    beq @dontUpdateFineDelay
+    lda joyP0
     and #JOY_LEFT
     beq :+
     ; Decrement with clamp-to-zero
@@ -586,7 +589,7 @@ UpdateRewritePosition:
     bpl :+
     inc fineDelay
 :
-    lda joyP0 ;joy0,x
+    lda joyP0
     and #JOY_RIGHT
     beq :+
     ; Increment with clamp-to-3
@@ -596,6 +599,7 @@ UpdateRewritePosition:
     bne :+
     dec fineDelay
 :
+@dontUpdateFineDelay:
     lda joy0,x
     and #JOY_UP
     beq :+
@@ -1106,7 +1110,7 @@ UploadNameTable:
 InitOAM:
     ldx #0
 :
-    ; Y = 74 + (spriteIndex / 8) * 9
+    ; Y = 70 + (spriteIndex / 8) * 9
     txa
     lsr
     lsr
@@ -1120,7 +1124,7 @@ InitOAM:
     clc
     adc tmpB
     clc
-    adc #74
+    adc #70
     sta sprites,x
     ; Tile number = spriteIndex
     txa
