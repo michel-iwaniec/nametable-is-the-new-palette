@@ -35,11 +35,10 @@
 ;   - This sets up the address so that it will increment to $3Fxx on the start of the *next* hblank
 ;  2nd hblank:
 ;   - Writes to (a-mirror-of*) $2005 *before* the hblank starts, so that VADDR points at the appropriate palette index
-;   - Does "stx $2001" + "sta $2007" + "sty $2001" to disable rendering, write the palette and re-enable the screen in as few cycles as possible.
+;   - Writes (a-mirror-of*) $2005 at start of hblank, so that the pixels output on the next scanline have the correct fine-x
+;   - Writes $2001 / $2007 / $2001 to disable rendering, write the palette and re-enable the screen in as few cycles as possible.
 ;   - Writes $2006 to re-initialize bits 0-5 of VADDR to once again serve as coarse-scroll, just in time for fetch of two first tiles of next scanline.
-;   - Writes (a-mirror-of*) $2005 at end of hblank, so that the pixels output on the next scanline have the correct fine-x
-;   - Performs a dummy write to $2005 to reset the toggle
-;   - Note that the X CPU register is used both for turning screen off via $2001 *and* the last fine-x write to $2005, as the bits don't overlap.
+;   - Performs a final write to $2001 to restore correct settings, as a previous write shared bits with the palette rewrite value
 ;   - The second hblank is executed in ZP RAM, to allow self-modifying code and save a cycle.
 ;  3rd hblank:
 ;    - Does a full loopy-scroll write to the scrolling / address registers so that they once again use the usual scroll coordinates
@@ -130,6 +129,7 @@ fineDelay:                      .res 1          ; HBlank fine-tuning delay
 frameCounter:                   .res 1
 tmpB:                           .res 2
 delayMacroVar:                  .res 1
+x2001_enableOrDisableMask:      .res 1          ; $2001 render mask for reg X in HBlank code
 palRewriteIndex:                .res 1          ; Palette index to rewrite mid-frame
 palRewriteValue:                .res 1          ; Palette value to rewrite mid-frame
 palRewriteScanline:             .res 1          ; Desired scanline to execute palette rewrite
@@ -244,9 +244,9 @@ reset:
     jsr SetPalette
     WRITE_PALETTE_CACHE
     jsr InitOAM
-    ; Disable sprites in leftmost column, to avoid it glitching when interrupting the sprite fetch in the prior hblank
-    lda #$1A
-    sta r2001    
+    ; Disable sprites / BG in leftmost column
+    lda #$18
+    sta r2001
     ; Start off with changing BG0 to a bright green
     lda #$2A
     sta palRewriteValue
@@ -357,7 +357,7 @@ RewritePaletteWithoutGlitch:
 @bankSwitchNT1:
     ldx #$80
     stx @bankSwitchNT1+1
-    DELAY 3
+    DELAY 4
     DELAY_ACC
     ; Set upper byte of T to #$3F / #$7F directly to prepare for *next hblank*, and reset latch to 1st write
     lda #$0F
@@ -378,8 +378,9 @@ RewritePaletteWithoutGlitch:
     tay
     lda ScrollX
     and #7
-    tax
     sta tmpB+1
+    ora x2001_enableOrDisableMask
+    tax
     ; Set de-glitch pattern for fine-X
     lda xFineHiByteTab,x
     sta z:<(PaletteWriteHBlankCodeRAM + (PaletteWriteHBlankCodeROM_writeCurrentFineX - PaletteWriteHBlankCodeROM) + 2)
@@ -399,7 +400,7 @@ BackFromPaletteWriteHBlankCode:
     lda #10
     sta numLines
 
-    DELAY 18
+    DELAY 6
     ; Adjust ScrollY_t to compensate for previous hblanks
     jsr IncScrollY_t
     ldy ScrollY_t
@@ -428,18 +429,22 @@ BackFromPaletteWriteHBlankCode:
 PaletteWriteHBlankCodeROM:
 PaletteWriteHBlankCodeROM_writeCurrentFineX:
     sta $2005           ; Write old fine-X and palette index before dot 256
-    nop
-    nop
-    lda palRewriteValue ; Load palette value
-    stx $2001           ; (1) Disable rendering (after dot 256)
-    sta $2007           ; (4) Write palette value
-    sty $2001           ; (4) Enable rendering
+    bit $2002
 PaletteWriteHBlankCodeROM_loadCoarseX:
-    lda #0              ; (2) Load coarse-X for scrolling
-    sta $2006           ; (4) Write coarse-X for scrolling
+    ldy #0
+    lda palRewriteValue ; Load palette value
 PaletteWriteHBlankCodeROM_writeNextFineX:
-    stx $2005           ; (4) Write fine-X for scrolling (re-use) -> 1 + 4 + 4 + 2 + 4 + 4 = 19 cycles to performs palette rewrite
-    stx $2005           ; Second dummy write (will be corrected in next hblank)
+    stx $2005           ; Write fine-X for scrolling
+PaletteWriteHBlankCodeROM_renderingDisable:
+    stx $2001           ; (1) Disable rendering (after dot 256)
+PaletteWriteHBlankCodeROM_writeValue:
+    sta $2007           ; (4) Write palette value
+    sty $2006           ; (4) Restore coarse-X for scrolling
+PaletteWriteHBlankCodeROM_renderingEnable:
+    sta $3801           ; (4) Enable rendering
+PaletteWriteHBlankCodeROM_load2001:
+    lda #$18
+    sta $3801           ; (4) Fully restore all $2001 bits to correct state
     jmp BackFromPaletteWriteHBlankCode
 
 CopyPaletteWriteHBlankCodeToRAM:
@@ -804,10 +809,46 @@ UpdateState:
     jsr UpdateSpriteGrid
     jsr UpdateEmphasisBits
     jsr SetScanlineAccumulator
+    jsr PatchWithAAXorXAA
     inc frameCounter
     rts
 
-
+;
+; Patches hblank code to either use:
+;
+;   sta $2001 / sta $2001 / stx $2001 (AAX)
+; or:
+;   stx $2001 / sta $2001 / sta $2001 (XAA)
+;
+; ...based on whether a write of palRewriteValue to $2001 would disable or enable rendering.
+; This trick frees up a register to make the $2006 write to restore scrolling happen 2 CPU cycles earlier.
+;
+PatchWithAAXorXAA:
+    ;
+    lda r2001
+    sta z:<(PaletteWriteHBlankCodeRAM + (PaletteWriteHBlankCodeROM_load2001 - PaletteWriteHBlankCodeROM + 1))
+    lda palRewriteValue
+    and #$18
+    bne @xaa
+    ; palRewriteValue would disable rendering - use AAX write pattern
+    lda #$18
+    sta x2001_enableOrDisableMask
+    ldx #$8D ; lda_abs opcode
+    txa
+    ldy #$8E ; ldx_abs opcode
+    jmp @patchOpcodes
+@xaa:
+    ; palRewriteValue would enable rendering - use XAA write pattern
+    lda #$00
+    sta x2001_enableOrDisableMask
+    ldx #$8E ; ldx_abs opcode
+    lda #$8D ; lda_abs opcode
+    tay
+@patchOpcodes:
+    stx z:<(PaletteWriteHBlankCodeRAM + (PaletteWriteHBlankCodeROM_renderingDisable - PaletteWriteHBlankCodeROM))
+    sta z:<(PaletteWriteHBlankCodeRAM + (PaletteWriteHBlankCodeROM_writeValue - PaletteWriteHBlankCodeROM))
+    sty z:<(PaletteWriteHBlankCodeRAM + (PaletteWriteHBlankCodeROM_renderingEnable - PaletteWriteHBlankCodeROM))
+    rts
 ;
 ; Rounds the scanline to start the palette rewrite effect, so it always takes place at y = 3 or y = 7
 ; Additionally sets the row to be copied based on ScrollY + rounding
